@@ -227,6 +227,8 @@ pub struct CommitFile {
     pub old_text: Option<String>,
     pub new_text: Option<String>,
     pub is_binary: bool,
+    pub old_binary: Option<Vec<u8>>,
+    pub new_binary: Option<Vec<u8>>,
 }
 
 impl CommitFile {
@@ -239,7 +241,10 @@ impl CommitFile {
     }
 }
 
-fn decode_commit_diff(diff: git::repository::CommitDiff) -> CommitDiff {
+fn decode_commit_diff(
+    diff: git::repository::CommitDiff,
+    binary_path: Option<&RepoPath>,
+) -> CommitDiff {
     let files = diff
         .files
         .into_iter()
@@ -252,10 +257,13 @@ fn decode_commit_diff(diff: git::repository::CommitDiff) -> CommitDiff {
             } = file;
 
             if is_binary {
+                let include_binary = binary_path == Some(&path);
                 return CommitFile {
                     path,
-                    old_text: old_content.map(|_| String::new()),
-                    new_text: new_content.map(|_| String::new()),
+                    old_text: old_content.as_ref().map(|_| String::new()),
+                    new_text: new_content.as_ref().map(|_| String::new()),
+                    old_binary: old_content.filter(|_| include_binary),
+                    new_binary: new_content.filter(|_| include_binary),
                     is_binary,
                 };
             }
@@ -285,6 +293,8 @@ fn decode_commit_diff(diff: git::repository::CommitDiff) -> CommitDiff {
                 old_text,
                 new_text,
                 is_binary,
+                old_binary: None,
+                new_binary: None,
             }
         })
         .collect();
@@ -4541,11 +4551,18 @@ impl GitStore {
         let repository_id = RepositoryId::from_proto(envelope.payload.repository_id);
         let repository_handle = Self::repository_for_request(&this, repository_id, &mut cx)?;
 
+        let binary_path = envelope
+            .payload
+            .binary_path
+            .as_deref()
+            .map(RepoPath::from_proto)
+            .transpose()?;
         let commit_diff = repository_handle
             .update(&mut cx, |repository_handle, _| {
                 repository_handle.load_commit_diff(
                     envelope.payload.commit,
                     envelope.payload.ignore_shallow_boundary,
+                    binary_path,
                 )
             })
             .await??;
@@ -4558,6 +4575,8 @@ impl GitStore {
                     old_text: file.old_text,
                     new_text: file.new_text,
                     is_binary: file.is_binary,
+                    old_binary: file.old_binary,
+                    new_binary: file.new_binary,
                 })
                 .collect(),
             is_shallow_boundary: commit_diff.is_shallow_boundary,
@@ -7181,6 +7200,7 @@ impl Repository {
         &mut self,
         commit: String,
         ignore_shallow_boundary: bool,
+        binary_path: Option<RepoPath>,
     ) -> oneshot::Receiver<Result<CommitDiff>> {
         let id = self.id;
         self.send_job("load_commit_diff", None, move |git_repo, cx| async move {
@@ -7188,7 +7208,7 @@ impl Repository {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => backend
                     .load_commit(commit, ignore_shallow_boundary, cx)
                     .await
-                    .map(decode_commit_diff),
+                    .map(|diff| decode_commit_diff(diff, binary_path.as_ref())),
                 RepositoryState::Remote(RemoteRepositoryState {
                     client, project_id, ..
                 }) => {
@@ -7198,6 +7218,7 @@ impl Repository {
                             repository_id: id.to_proto(),
                             commit,
                             ignore_shallow_boundary,
+                            binary_path: binary_path.map(|path| path.as_unix_str().to_owned()),
                         })
                         .await?;
                     Ok(CommitDiff {
@@ -7210,6 +7231,8 @@ impl Repository {
                                     old_text: file.old_text,
                                     new_text: file.new_text,
                                     is_binary: file.is_binary,
+                                    old_binary: file.old_binary,
+                                    new_binary: file.new_binary,
                                 })
                             })
                             .collect::<Result<Vec<_>>>()?,
@@ -11369,6 +11392,39 @@ mod tests {
     use serde_json::json;
     use settings::SettingsStore;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn test_commit_diff_preserves_binary_versions() {
+        let bytes = b"P6\n1 1\n255\n\xff\0\0".to_vec();
+        for include_binary in [false, true] {
+            for (old_content, new_content, status) in [
+                (None, Some(bytes.clone()), CommitFileStatus::Added),
+                (Some(bytes.clone()), None, CommitFileStatus::Deleted),
+                (
+                    Some(bytes.clone()),
+                    Some(bytes.clone()),
+                    CommitFileStatus::Modified,
+                ),
+            ] {
+                let diff = decode_commit_diff(
+                    git::repository::CommitDiff {
+                        files: vec![git::repository::CommitFile {
+                            path: repo_path("image.ppm"),
+                            old_content: old_content.clone(),
+                            new_content: new_content.clone(),
+                            is_binary: true,
+                        }],
+                        is_shallow_boundary: false,
+                    },
+                    include_binary.then_some(&repo_path("image.ppm")),
+                );
+                let file = diff.files.first().expect("binary file");
+                assert_eq!(file.old_binary, old_content.filter(|_| include_binary));
+                assert_eq!(file.new_binary, new_content.filter(|_| include_binary));
+                assert_eq!(file.status(), status);
+            }
+        }
+    }
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {

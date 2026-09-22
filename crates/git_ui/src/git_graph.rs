@@ -2156,8 +2156,9 @@ impl GitGraph {
 
         self.load_selected_commit_message(cx, &commit_message_handle, &repository);
 
-        let diff_receiver =
-            repository.update(cx, |repo, _| repo.load_commit_diff(diff_handle, false));
+        let diff_receiver = repository.update(cx, |repo, _| {
+            repo.load_commit_diff(diff_handle, false, None)
+        });
 
         self._commit_diff_task = Some(cx.spawn(async move |this, cx| {
             if let Ok(Ok(diff)) = diff_receiver.await {
@@ -7676,6 +7677,8 @@ mod tests {
                     old_text: Some("content".into()),
                     new_text: Some("updated content".into()),
                     is_binary: false,
+                    old_binary: None,
+                    new_binary: None,
                 }],
                 is_shallow_boundary: false,
             });

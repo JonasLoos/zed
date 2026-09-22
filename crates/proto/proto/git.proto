@@ -299,6 +299,7 @@ message LoadCommitDiff {
   uint64 repository_id = 3;
   string commit = 4;
   bool ignore_shallow_boundary = 5;
+  optional string binary_path = 6;
 }
 
 message LoadCommitDiffResponse {
@@ -311,6 +312,8 @@ message CommitFile {
   optional string old_text = 2;
   optional string new_text = 3;
   bool is_binary = 4;
+  optional bytes old_binary = 5;
+  optional bytes new_binary = 6;
 }
 
 message GitReset {
