@@ -5273,7 +5273,7 @@ Run the {#action theme_selector::Toggle} action in the command palette to see a 
     "show_onboarding_banner": true,
     "show_user_picture": true,
     "show_user_menu": true,
-    "show_sign_in": true,
+    "show_sign_in": false,
     "show_menus": false,
     "button_layout": "platform_default"
   }
