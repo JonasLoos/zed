@@ -5,6 +5,16 @@
 
 Welcome to Zed, a high-performance, multiplayer code editor.
 
+### Install
+
+To build this fork, install the prerequisites for [macOS](docs/src/development/macos.md#dependencies), [Linux](docs/src/development/linux.md#dependencies), or [Windows](docs/src/development/windows.md#dependencies), then:
+
+```sh
+git clone https://github.com/JonasLoos/zed.git
+cd zed
+cargo run --release
+```
+
 ### Licensing
 
 Zed source code is licensed primarily under GPL-3.0-or-later, with Apache-2.0 components where marked.
