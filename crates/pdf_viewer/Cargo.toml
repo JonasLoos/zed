@@ -1,0 +1,37 @@
+[package]
+name = "pdf_viewer"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/pdf_viewer.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+db.workspace = true
+file_icons.workspace = true
+gpui.workspace = true
+hayro = "=0.7.1"
+image.workspace = true
+parking_lot.workspace = true
+project.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+worktree.workspace = true
+
+[dev-dependencies]
+fs = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+settings.workspace = true
+theme.workspace = true
+theme_settings.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

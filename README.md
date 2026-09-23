@@ -1,4 +1,7 @@
 > [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
+> [!IMPORTANT]
 > This is a fork of [zed](https://github.com/zed-industries/zed) with various adjustments, including an updated git diff viewer.
 
 # Zed
