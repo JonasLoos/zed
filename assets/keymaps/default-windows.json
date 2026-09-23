@@ -1578,6 +1578,7 @@
       "home": "pdf_viewer::FirstPage",
       "end": "pdf_viewer::LastPage",
       "ctrl-r": "pdf_viewer::Reload",
+      "ctrl-c": "pdf_viewer::CopySelection",
     },
   },
   {

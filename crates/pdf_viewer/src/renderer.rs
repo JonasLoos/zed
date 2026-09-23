@@ -11,6 +11,8 @@ use hayro::{
 };
 use parking_lot::Mutex;
 
+use crate::interaction::{PageContent, extract_page_content};
+
 const MAX_PIXELS: f32 = 8_000_000.0;
 const MAX_DIMENSION: f32 = 8192.0;
 const MAX_PENDING_PAGES: usize = 16;
@@ -50,6 +52,7 @@ struct RenderQueue {
 pub struct RenderedPage {
     pub key: RenderKey,
     pub result: Result<Arc<RenderImage>>,
+    pub content: Arc<PageContent>,
 }
 
 pub struct Renderer {
@@ -90,6 +93,7 @@ impl Renderer {
                     return;
                 }
                 let mut cache = RenderCache::new();
+                let mut page_content = vec![None; document.pages().len()];
                 let mut rendered_count = 0;
                 while wake_receiver.recv().await.is_ok() {
                     loop {
@@ -99,6 +103,16 @@ impl Renderer {
                             queue.active
                         };
                         let Some(key) = key else { break };
+                        let content = page_content[key.page]
+                            .get_or_insert_with(|| {
+                                Arc::new(
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        extract_page_content(&document, key.page)
+                                    }))
+                                    .unwrap_or_default(),
+                                )
+                            })
+                            .clone();
                         // Hayro's resource cache has no eviction API. Periodically release it
                         // so browsing a long document does not retain every decoded resource.
                         if rendered_count == 32 {
@@ -116,7 +130,11 @@ impl Renderer {
                         }
                         rendered_count += 1;
                         if result_sender
-                            .send(RenderedPage { key, result })
+                            .send(RenderedPage {
+                                key,
+                                result,
+                                content,
+                            })
                             .await
                             .is_err()
                         {

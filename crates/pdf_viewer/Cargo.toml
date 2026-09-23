@@ -20,6 +20,7 @@ file_icons.workspace = true
 gpui.workspace = true
 hayro = "=0.7.1"
 image.workspace = true
+kurbo = "0.13.1"
 parking_lot.workspace = true
 project.workspace = true
 ui.workspace = true

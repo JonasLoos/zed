@@ -12870,6 +12870,7 @@ dependencies = [
  "gpui",
  "hayro",
  "image",
+ "kurbo",
  "parking_lot",
  "project",
  "settings",

@@ -9,6 +9,7 @@ use project::{Project, ProjectEntryId, ProjectPath};
 use util::ResultExt as _;
 use worktree::Worktree;
 
+use crate::interaction::PageContent;
 use crate::renderer::{PageSize, RenderKey, RenderedPage, Renderer};
 
 const CACHE_BYTES: usize = 96 * 1024 * 1024;
@@ -43,6 +44,7 @@ pub struct PdfDocument {
     entry_id: Option<ProjectEntryId>,
     worktree: Entity<Worktree>,
     renderer: Option<Renderer>,
+    content: Vec<Option<Arc<PageContent>>>,
     cache: VecDeque<CachedPage>,
     cache_bytes: usize,
     _subscription: Subscription,
@@ -107,6 +109,7 @@ impl PdfDocument {
                 entry_id,
                 worktree,
                 renderer: None,
+                content: Vec::new(),
                 cache: VecDeque::new(),
                 cache_bytes: 0,
                 _subscription: subscription,
@@ -180,6 +183,7 @@ impl PdfDocument {
         self.clear_cache(cx);
         self.generation += 1;
         self.sizes = renderer.sizes.clone();
+        self.content = vec![None; self.sizes.len()];
         self.loading = false;
         self.error = None;
         let results = renderer.results.clone();
@@ -222,7 +226,14 @@ impl PdfDocument {
             .cloned())
     }
 
+    pub fn content(&self, page: usize) -> Option<&Arc<PageContent>> {
+        self.content.get(page)?.as_ref()
+    }
+
     fn cache_page(&mut self, page: RenderedPage, cx: &mut Context<Self>) {
+        if let Some(content) = self.content.get_mut(page.key.page) {
+            *content = Some(page.content.clone());
+        }
         if let Some(index) = self.cache.iter().position(|cached| cached.key == page.key)
             && let Some(previous) = self.cache.remove(index)
         {

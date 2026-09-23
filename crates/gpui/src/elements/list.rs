@@ -374,6 +374,25 @@ impl ListState {
         self.apply_uniform_item_height(height);
     }
 
+    /// Reset the list with known item heights, so unrendered items contribute to scrolling.
+    pub fn reset_with_item_heights(&self, heights: impl IntoIterator<Item = Pixels>) {
+        let heights = heights.into_iter().collect::<Vec<_>>();
+        self.reset(heights.len());
+        let mut state = self.0.borrow_mut();
+        let mut items = SumTree::default();
+        items.extend(
+            heights.into_iter().map(|height| ListItem::Unmeasured {
+                size_hint: Some(Size {
+                    width: px(0.),
+                    height,
+                }),
+                focus_handle: None,
+            }),
+            (),
+        );
+        state.items = items;
+    }
+
     fn apply_uniform_item_height(&self, height: Pixels) {
         let size_hint = Size {
             width: px(0.),

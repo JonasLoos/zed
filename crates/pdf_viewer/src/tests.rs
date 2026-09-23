@@ -1,6 +1,6 @@
 use super::*;
 use fs::{FakeFs, Fs as _};
-use gpui::{BackgroundExecutor, TestAppContext};
+use gpui::{BackgroundExecutor, Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext};
 use renderer::Renderer;
 use std::{path::Path, sync::Arc};
 use util::rel_path::rel_path;
@@ -10,8 +10,18 @@ fn test_pdf(pages: &[(u32, u32, &str)]) -> Vec<u8> {
 }
 
 fn test_pdf_with_attributes(pages: &[(u32, u32, &str)], attributes: &str, text: bool) -> Vec<u8> {
+    test_pdf_with_extra_objects(pages, attributes, text, "", &[])
+}
+
+fn test_pdf_with_extra_objects(
+    pages: &[(u32, u32, &str)],
+    attributes: &str,
+    text: bool,
+    catalog_attributes: &str,
+    extra_objects: &[&str],
+) -> Vec<u8> {
     let mut objects = vec![
-        "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+        format!("<< /Type /Catalog /Pages 2 0 R {catalog_attributes} >>"),
         format!(
             "<< /Type /Pages /Count {} /Kids [{}] >>",
             pages.len(),
@@ -32,6 +42,7 @@ fn test_pdf_with_attributes(pages: &[(u32, u32, &str)], attributes: &str, text: 
             content.len()
         ));
     }
+    objects.extend(extra_objects.iter().map(|object| (*object).to_owned()));
     let mut pdf = "%PDF-1.7\n".to_owned();
     let mut offsets = Vec::new();
     for (index, object) in objects.iter().enumerate() {
@@ -51,6 +62,186 @@ fn test_pdf_with_attributes(pages: &[(u32, u32, &str)], attributes: &str, text: 
         objects.len() + 1
     ));
     pdf.into_bytes()
+}
+
+#[test]
+fn extracts_text_and_external_and_internal_links() {
+    let pdf = hayro::hayro_syntax::Pdf::new(test_pdf_with_extra_objects(
+        &[(300, 200, "1 1 1"), (300, 200, "1 1 1")],
+        "/Annots [7 0 R 8 0 R]",
+        true,
+        "",
+        &[
+            "<< /Type /Annot /Subtype /Link /Rect [10 10 100 40] /A << /S /URI /URI (https://example.com) >> >>",
+            "<< /Type /Annot /Subtype /Link /Rect [10 50 100 80] /A << /S /GoTo /D [5 0 R /Fit] >> >>",
+        ],
+    ))
+    .expect("PDF should load");
+    let content = interaction::extract_page_content(&pdf, 0);
+    let text = content
+        .glyphs
+        .iter()
+        .map(|glyph| glyph.text.as_str())
+        .collect::<String>();
+    assert!(text.contains("Native PDF preview"), "{text}");
+    assert!(content.glyphs.iter().all(|glyph| {
+        glyph.bounds.x0 >= 0.
+            && glyph.bounds.y0 >= 0.
+            && glyph.bounds.x1 <= 300.
+            && glyph.bounds.y1 <= 200.
+    }));
+    assert!(matches!(
+        &content.links[0].destination,
+        interaction::LinkDestination::Url(url) if url == "https://example.com"
+    ));
+    assert!(matches!(
+        content.links[1].destination,
+        interaction::LinkDestination::Page(1)
+    ));
+}
+
+#[test]
+fn resolves_named_pdf_destinations() {
+    let pdf = hayro::hayro_syntax::Pdf::new(test_pdf_with_extra_objects(
+        &[(300, 200, "1 1 1"), (300, 200, "1 1 1")],
+        "/Annots [7 0 R 8 0 R]",
+        false,
+        "/Dests << /section [5 0 R /Fit] >> /Names << /Dests << /Names [(named) [5 0 R /Fit]] >> >>",
+        &[
+            "<< /Type /Annot /Subtype /Link /Rect [10 10 100 40] /A << /S /GoTo /D /section >> >>",
+            "<< /Type /Annot /Subtype /Link /Rect [10 50 100 80] /Dest (named) >>",
+        ],
+    ))
+    .expect("PDF should load");
+    let content = interaction::extract_page_content(&pdf, 0);
+    assert_eq!(content.links.len(), 2);
+    assert!(
+        content
+            .links
+            .iter()
+            .all(|link| { matches!(link.destination, interaction::LinkDestination::Page(1)) })
+    );
+}
+
+#[gpui::test]
+async fn fresh_view_has_full_scroll_range_and_zooms_around_center(cx: &mut TestAppContext) {
+    let (_fs, _project, document) = open_document(cx).await;
+    let (view, visual) = cx.add_window_view(|_, cx| PdfView::new(document.clone(), cx));
+    visual.run_until_parked();
+    let initial_scroll_range = visual.read(|cx| view.read(cx).list.max_offset_for_scrollbar().y);
+    assert!(initial_scroll_range > px(100.));
+    let viewport = visual.read(|cx| view.read(cx).list.viewport_bounds());
+    visual.simulate_event(ScrollWheelEvent {
+        position: point(
+            viewport.left() + viewport.size.width / 2.,
+            viewport.top() + viewport.size.height / 2.,
+        ),
+        delta: ScrollDelta::Pixels(point(px(0.), px(-900.))),
+        ..Default::default()
+    });
+    visual.run_until_parked();
+    visual.read(|cx| assert!(document.read(cx).content(1).is_some()));
+    let expected = view.update_in(visual, |view, _, cx| {
+        let old_width = view.content_width(view.scale(cx));
+        view.set_zoom(Some(view.scale(cx) * 2.), cx);
+        let new_width = view.content_width(view.scale(cx));
+        (new_width - old_width) / 2.
+    });
+    visual.run_until_parked();
+    visual.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    visual.read(|cx| {
+        assert!((f32::from(view.read(cx).horizontal_scroll.offset().x) + expected).abs() < 1.);
+    });
+}
+
+#[gpui::test]
+async fn drag_selects_pdf_text_and_copies_it(cx: &mut TestAppContext) {
+    let (fs, _project, document) = open_document(cx).await;
+    let generation = cx.read(|cx| document.read(cx).generation);
+    fs.insert_file(
+        "/root/document.pdf",
+        test_pdf_with_attributes(&[(300, 200, "1 1 1")], "", true),
+    )
+    .await;
+    document
+        .condition(cx, move |document, _| document.generation > generation)
+        .await;
+    let (view, visual) = cx.add_window_view(|_, cx| PdfView::new(document.clone(), cx));
+    visual.run_until_parked();
+    let (start, end) = visual.read(|cx| {
+        let view = view.read(cx);
+        let bounds = view.page_bounds[0].expect("page bounds");
+        let content = document.read(cx).content(0).expect("text content");
+        let scale = view.scale(cx);
+        let point_for = |index: usize| {
+            let glyph = &content.glyphs[index];
+            point(
+                bounds.left() + px((glyph.bounds.x0 + glyph.bounds.x1) * scale / 2.),
+                bounds.top() + px((glyph.bounds.y0 + glyph.bounds.y1) * scale / 2.),
+            )
+        };
+        (point_for(0), point_for(5))
+    });
+    visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+    visual.simulate_mouse_move(end, MouseButton::Left, Modifiers::none());
+    visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+    visual.dispatch_action(CopySelection);
+    assert_eq!(
+        visual.read_from_clipboard().and_then(|item| item.text()),
+        Some("Native".to_owned())
+    );
+}
+
+#[gpui::test]
+async fn clicks_pdf_links(cx: &mut TestAppContext) {
+    let (fs, _project, document) = open_document(cx).await;
+    let generation = cx.read(|cx| document.read(cx).generation);
+    fs.insert_file(
+        "/root/document.pdf",
+        test_pdf_with_extra_objects(
+            &[(300, 200, "1 1 1"), (300, 200, "1 1 1")],
+            "/Annots [7 0 R 8 0 R]",
+            false,
+            "",
+            &[
+                "<< /Type /Annot /Subtype /Link /Rect [10 100 100 130] /A << /S /URI /URI (https://example.com) >> >>",
+                "<< /Type /Annot /Subtype /Link /Rect [10 140 100 170] /A << /S /GoTo /D [5 0 R /Fit] >> >>",
+            ],
+        ),
+    )
+    .await;
+    document
+        .condition(cx, move |document, _| document.generation > generation)
+        .await;
+    let (view, visual) = cx.add_window_view(|_, cx| PdfView::new(document.clone(), cx));
+    visual.run_until_parked();
+    visual.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let links = visual.read(|cx| {
+        let view = view.read(cx);
+        let bounds = view.page_bounds[0].expect("page bounds");
+        let scale = view.scale(cx);
+        document
+            .read(cx)
+            .content(0)
+            .expect("link content")
+            .links
+            .iter()
+            .map(|link| {
+                point(
+                    bounds.left() + px((link.bounds.x0 + link.bounds.x1) * scale / 2.),
+                    bounds.top() + px((link.bounds.y0 + link.bounds.y1) * scale / 2.),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    visual.simulate_click(links[0], Modifiers::none());
+    assert_eq!(visual.opened_url(), Some("https://example.com".to_owned()));
+    visual.simulate_click(links[1], Modifiers::none());
+    visual.read(|cx| assert_eq!(view.read(cx).current_page, 1));
 }
 
 #[gpui::test]
@@ -95,16 +286,23 @@ async fn invalid_pdf_reports_an_error(executor: BackgroundExecutor) {
 
 #[gpui::test]
 async fn renders_standard_fonts_and_rotated_crop_boxes(executor: BackgroundExecutor) {
-    let renderer = Renderer::new(
-        test_pdf_with_attributes(
-            &[(300, 200, "1 1 1")],
-            "/CropBox [0 0 250 100] /Rotate 90",
-            true,
-        ),
-        executor,
-    )
-    .await
-    .expect("PDF should load");
+    let pdf = test_pdf_with_attributes(
+        &[(300, 200, "1 1 1")],
+        "/CropBox [0 0 250 100] /Rotate 90",
+        true,
+    );
+    let metadata = interaction::extract_page_content(
+        &hayro::hayro_syntax::Pdf::new(pdf.clone()).expect("PDF should parse"),
+        0,
+    );
+    assert!(!metadata.glyphs.is_empty());
+    assert!(metadata.glyphs.iter().all(|glyph| {
+        glyph.bounds.x0 >= 0.
+            && glyph.bounds.y0 >= 0.
+            && glyph.bounds.x1 <= 100.
+            && glyph.bounds.y1 <= 250.
+    }));
+    let renderer = Renderer::new(pdf, executor).await.expect("PDF should load");
     assert_eq!(renderer.sizes[0].width, 100.);
     assert_eq!(renderer.sizes[0].height, 250.);
     renderer.request(RenderKey::new(0, renderer.sizes[0], 1.));

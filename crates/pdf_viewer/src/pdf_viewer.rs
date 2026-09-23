@@ -1,4 +1,5 @@
 mod document;
+mod interaction;
 mod persistence;
 mod renderer;
 
@@ -8,10 +9,11 @@ use anyhow::{Context as _, Result};
 use document::PdfDocument;
 use file_icons::FileIcons;
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
-    ListOffset, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, actions,
-    canvas, img, list, px,
+    AnyElement, App, Bounds, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    ListAlignment, ListOffset, ListState, MouseButton, Pixels, Point, Render, ScrollHandle,
+    SharedString, Subscription, Task, WeakEntity, Window, actions, canvas, img, list, point, px,
 };
+use interaction::LinkDestination;
 use persistence::PdfViewerDb;
 use project::{Project, ProjectPath};
 use renderer::{PageSize, RenderKey};
@@ -44,6 +46,8 @@ actions!(
         LastPage,
         /// Reload the PDF from disk.
         Reload,
+        /// Copy selected PDF text.
+        CopySelection,
     ]
 );
 
@@ -51,15 +55,31 @@ const PAGE_GAP: f32 = 16.0;
 const MIN_ZOOM: f32 = 0.1;
 const MAX_ZOOM: f32 = 8.0;
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TextPosition {
+    page: usize,
+    glyph: usize,
+}
+
+#[derive(Clone, Copy)]
+struct TextSelection {
+    start: TextPosition,
+    end: TextPosition,
+}
+
 pub struct PdfView {
     document: Entity<PdfDocument>,
     path: ProjectPath,
     focus_handle: FocusHandle,
     list: ListState,
+    horizontal_scroll: ScrollHandle,
     zoom: Option<f32>,
     viewport_width: f32,
     generation: u64,
     sizes: Vec<PageSize>,
+    page_bounds: Vec<Option<Bounds<Pixels>>>,
+    selection: Option<TextSelection>,
+    selecting: bool,
     current_page: usize,
     restored_position: Option<(usize, f32)>,
     _subscription: Subscription,
@@ -75,6 +95,7 @@ impl PdfView {
         list.set_scroll_handler(move |event, _, cx| {
             view.update(cx, |this, cx| {
                 this.current_page = event.visible_range.start;
+                this.page_bounds.fill(None);
                 cx.emit(PdfViewEvent);
                 cx.notify();
             })
@@ -91,7 +112,9 @@ impl PdfView {
                     .unwrap_or_else(|| this.position(cx));
                 this.generation = generation;
                 this.sizes = document.read(cx).sizes.clone();
-                this.list.reset(this.sizes.len());
+                this.page_bounds = vec![None; this.sizes.len()];
+                this.selection = None;
+                this.reset_list(cx);
                 this.restore_position(position, cx);
             }
             this.path = path;
@@ -100,19 +123,25 @@ impl PdfView {
             }
             cx.notify();
         });
-        Self {
+        let view = Self {
             generation: document.read(cx).generation,
             sizes: document.read(cx).sizes.clone(),
+            page_bounds: vec![None; document.read(cx).sizes.len()],
+            selection: None,
+            selecting: false,
             path: document.read(cx).path.clone(),
             document,
             focus_handle: cx.focus_handle(),
             list,
+            horizontal_scroll: ScrollHandle::new(),
             zoom: None,
             viewport_width: 800.,
             current_page: 0,
             restored_position: None,
             _subscription: subscription,
-        }
+        };
+        view.reset_list(cx);
+        view
     }
 
     fn scale(&self, _cx: &App) -> f32 {
@@ -120,6 +149,22 @@ impl PdfView {
             let widest = self.sizes.iter().map(|page| page.width).fold(1.0, f32::max);
             ((self.viewport_width - PAGE_GAP * 2.) / widest).clamp(MIN_ZOOM, MAX_ZOOM)
         })
+    }
+
+    fn content_width(&self, scale: f32) -> f32 {
+        self.sizes
+            .iter()
+            .map(|page| page.width * scale + PAGE_GAP * 2.)
+            .fold(self.viewport_width, f32::max)
+    }
+
+    fn reset_list(&self, cx: &App) {
+        let scale = self.scale(cx);
+        self.list.reset_with_item_heights(
+            self.sizes
+                .iter()
+                .map(|page| px(page.height * scale + PAGE_GAP)),
+        );
     }
 
     fn position(&self, cx: &App) -> (usize, f32) {
@@ -150,8 +195,18 @@ impl PdfView {
     }
 
     fn set_zoom(&mut self, zoom: Option<f32>, cx: &mut Context<Self>) {
+        let position = self.position(cx);
+        let old_width = self.content_width(self.scale(cx));
+        let old_center = -f32::from(self.horizontal_scroll.offset().x) + self.viewport_width / 2.;
         self.zoom = zoom.map(|zoom| zoom.clamp(MIN_ZOOM, MAX_ZOOM));
-        self.list.remeasure();
+        let new_width = self.content_width(self.scale(cx));
+        let new_scroll = (old_center / old_width * new_width - self.viewport_width / 2.)
+            .clamp(0., (new_width - self.viewport_width).max(0.));
+        self.horizontal_scroll
+            .set_offset(point(px(-new_scroll), px(0.)));
+        self.page_bounds.fill(None);
+        self.reset_list(cx);
+        self.restore_position(position, cx);
         cx.emit(PdfViewEvent);
         cx.notify();
     }
@@ -190,31 +245,191 @@ impl PdfView {
             .update(cx, |document, cx| document.reload(false, cx));
     }
 
+    fn nearest_glyph(&self, position: Point<Pixels>, cx: &App) -> Option<(TextPosition, f32)> {
+        let scale = self.scale(cx);
+        let document = self.document.read(cx);
+        self.page_bounds
+            .iter()
+            .enumerate()
+            .filter_map(|(page, bounds)| {
+                let bounds = bounds.as_ref()?;
+                let content = document.content(page)?;
+                Some((page, bounds, content))
+            })
+            .flat_map(|(page, bounds, content)| {
+                content.glyphs.iter().enumerate().map(move |(glyph, item)| {
+                    let left = bounds.left() + px(item.bounds.x0 * scale);
+                    let right = bounds.left() + px(item.bounds.x1 * scale);
+                    let top = bounds.top() + px(item.bounds.y0 * scale);
+                    let bottom = bounds.top() + px(item.bounds.y1 * scale);
+                    let dx = (left - position.x).max(px(0.)) + (position.x - right).max(px(0.));
+                    let dy = (top - position.y).max(px(0.)) + (position.y - bottom).max(px(0.));
+                    (TextPosition { page, glyph }, f32::from(dx + dy))
+                })
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+    }
+
+    fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        if selection.start == selection.end {
+            return;
+        }
+        let (start, end) = if selection.start <= selection.end {
+            (selection.start, selection.end)
+        } else {
+            (selection.end, selection.start)
+        };
+        let document = self.document.read(cx);
+        let mut text = String::new();
+        for page in start.page..=end.page {
+            let Some(content) = document.content(page) else {
+                continue;
+            };
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            let first = if page == start.page { start.glyph } else { 0 };
+            let last = if page == end.page {
+                end.glyph + 1
+            } else {
+                content.glyphs.len()
+            };
+            for glyph in content.glyphs.get(first..last).into_iter().flatten() {
+                text.push_str(&glyph.text);
+            }
+        }
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn is_selected(&self, page: usize, glyph: usize) -> bool {
+        let Some(selection) = self.selection else {
+            return false;
+        };
+        if selection.start == selection.end {
+            return false;
+        }
+        let (start, end) = if selection.start <= selection.end {
+            (selection.start, selection.end)
+        } else {
+            (selection.end, selection.start)
+        };
+        (start..=end).contains(&TextPosition { page, glyph })
+    }
+
     fn render_page(
         &mut self,
-        page: usize,
+        page_index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(size) = self.sizes.get(page).copied() else {
+        let Some(size) = self.sizes.get(page_index).copied() else {
             return div().into_any_element();
         };
         let scale = self.scale(cx);
-        let key = RenderKey::new(page, size, scale * window.scale_factor());
+        let key = RenderKey::new(page_index, size, scale * window.scale_factor());
         let image = self.document.update(cx, |document, _| document.page(key));
+        let content = self.document.read(cx).content(page_index).cloned();
         let page = div()
+            .relative()
             .w(px(size.width * scale))
             .h(px(size.height * scale))
             .flex_none()
             .bg(gpui::white())
             .flex()
             .items_center()
-            .justify_center();
-        let page = match image {
+            .justify_center()
+            .cursor_text();
+        let mut page = match image {
             Ok(Some(image)) => page.child(img(image).size_full()),
             Ok(None) => page.child(Label::new("Rendering page…").color(Color::Muted)),
             Err(error) => page.child(Label::new(error).color(Color::Error)),
         };
+        let measure_view = cx.weak_entity();
+        page = page.child(
+            canvas(
+                move |bounds, _, cx| {
+                    cx.defer(move |cx| {
+                        measure_view
+                            .update(cx, |view, _| {
+                                if let Some(slot) = view.page_bounds.get_mut(page_index) {
+                                    *slot = Some(bounds);
+                                }
+                            })
+                            .log_err();
+                    });
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        );
+        if let Some(content) = content {
+            for (glyph, text) in content.glyphs.iter().enumerate() {
+                if self.is_selected(page_index, glyph) {
+                    let bounds = text.bounds;
+                    page = page.child(
+                        div()
+                            .absolute()
+                            .left(px(bounds.x0 * scale))
+                            .top(px(bounds.y0 * scale))
+                            .w(px((bounds.x1 - bounds.x0) * scale))
+                            .h(px((bounds.y1 - bounds.y0) * scale))
+                            .bg(cx.theme().colors().element_selection_background),
+                    );
+                }
+            }
+            for (index, link) in content.links.iter().enumerate() {
+                let bounds = link.bounds;
+                let destination = link.destination.clone();
+                let view = cx.weak_entity();
+                page = page.child(
+                    div()
+                        .id((
+                            gpui::ElementId::from(("pdf-link", page_index)),
+                            index.to_string(),
+                        ))
+                        .absolute()
+                        .left(px(bounds.x0 * scale))
+                        .top(px(bounds.y0 * scale))
+                        .w(px((bounds.x1 - bounds.x0) * scale))
+                        .h(px((bounds.y1 - bounds.y0) * scale))
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| match &destination {
+                            LinkDestination::Url(url) => cx.open_url(url),
+                            LinkDestination::Page(page) => {
+                                view.update(cx, |view, cx| view.go_to_page(*page, cx))
+                                    .log_err();
+                            }
+                        }),
+                );
+            }
+        }
+        let view = cx.weak_entity();
+        let page = page.on_mouse_down(MouseButton::Left, move |event, window, cx| {
+            view.update(cx, |view, cx| {
+                window.focus(&view.focus_handle, cx);
+                if let Some((position, distance)) = view.nearest_glyph(event.position, cx)
+                    && position.page == page_index
+                    && distance <= 8.
+                {
+                    view.selection = Some(TextSelection {
+                        start: position,
+                        end: position,
+                    });
+                    view.selecting = true;
+                } else {
+                    view.selection = None;
+                    view.selecting = false;
+                }
+                cx.notify();
+            })
+            .log_err();
+        });
         div()
             .w_full()
             .h(px(size.height * scale + PAGE_GAP))
@@ -239,11 +454,7 @@ impl Render for PdfView {
         let error = document.error.clone();
         let loading = document.loading;
         let scale = self.scale(cx);
-        let width = self
-            .sizes
-            .iter()
-            .map(|page| page.width * scale + PAGE_GAP * 2.)
-            .fold(self.viewport_width, f32::max);
+        let width = self.content_width(scale);
         let view = cx.entity();
         let measure_view = cx.weak_entity();
         v_flex()
@@ -260,6 +471,32 @@ impl Render for PdfView {
             .on_action(cx.listener(Self::first_page))
             .on_action(cx.listener(Self::last_page))
             .on_action(cx.listener(Self::reload))
+            .on_action(cx.listener(Self::copy_selection))
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                if this.selecting && event.pressed_button == Some(MouseButton::Left) {
+                    let end = this
+                        .nearest_glyph(event.position, cx)
+                        .map(|(position, _)| position);
+                    if let (Some(selection), Some(end)) = (&mut this.selection, end)
+                        && selection.end != end
+                    {
+                        selection.end = end;
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    this.selecting = false;
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    this.selecting = false;
+                }),
+            )
             .on_pinch(cx.listener(|this, event: &gpui::PinchEvent, _, cx| {
                 this.set_zoom(Some(this.scale(cx) * (1. + event.delta)), cx);
             }))
@@ -350,36 +587,45 @@ impl Render for PdfView {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .overflow_x_scroll()
                     .child(
-                        canvas(
-                            move |bounds, _, cx| {
-                                let width = f32::from(bounds.size.width);
-                                cx.defer(move |cx| {
-                                    measure_view
-                                        .update(cx, |this, cx| {
-                                            if width > 0.
-                                                && (this.viewport_width - width).abs() > 0.5
-                                            {
-                                                this.viewport_width = width;
-                                                this.list.remeasure();
-                                                cx.notify();
-                                            }
-                                        })
-                                        .log_err();
-                                });
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .size_full(),
-                    )
-                    .child(
-                        list(self.list.clone(), move |page, window, cx| {
-                            view.update(cx, |this, cx| this.render_page(page, window, cx))
-                        })
-                        .w(px(width))
-                        .h_full(),
+                        div()
+                            .id("pdf-horizontal-scroll")
+                            .size_full()
+                            .overflow_x_scroll()
+                            .track_scroll(&self.horizontal_scroll)
+                            .child(
+                                canvas(
+                                    move |bounds, _, cx| {
+                                        let width = f32::from(bounds.size.width);
+                                        cx.defer(move |cx| {
+                                            measure_view
+                                                .update(cx, |this, cx| {
+                                                    if width > 0.
+                                                        && (this.viewport_width - width).abs() > 0.5
+                                                    {
+                                                        let position = this.position(cx);
+                                                        this.viewport_width = width;
+                                                        this.page_bounds.fill(None);
+                                                        this.reset_list(cx);
+                                                        this.restore_position(position, cx);
+                                                        cx.notify();
+                                                    }
+                                                })
+                                                .log_err();
+                                        });
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .size_full(),
+                            )
+                            .child(
+                                list(self.list.clone(), move |page, window, cx| {
+                                    view.update(cx, |this, cx| this.render_page(page, window, cx))
+                                })
+                                .w(px(width))
+                                .h_full(),
+                            ),
                     )
                     .custom_scrollbars(
                         Scrollbars::new(ScrollAxes::Vertical).tracked_scroll_handle(&self.list),
@@ -446,6 +692,7 @@ impl Item for PdfView {
             let mut view = Self::new(self.document.clone(), cx);
             view.zoom = self.zoom;
             view.viewport_width = self.viewport_width;
+            view.reset_list(cx);
             view.restore_position(position, cx);
             view
         })))
@@ -523,6 +770,7 @@ impl SerializableItem for PdfView {
                     view.zoom = zoom
                         .filter(|zoom| zoom.is_finite())
                         .map(|zoom| (zoom as f32).clamp(MIN_ZOOM, MAX_ZOOM));
+                    view.reset_list(cx);
                     let position = (
                         page.max(0) as usize,
                         if fraction.is_finite() {
