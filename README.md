@@ -1,5 +1,5 @@
 > [!IMPORTANT]
-> This is a fork of [zed](https://github.com/zed-industries/zed) with various adjustments, including an updated git diff viewer.
+> This is a fork of [zed](https://github.com/zed-industries/zed) with various adjustments, including updated git diff handling and a pdf viewer.
 
 # Zed
 
