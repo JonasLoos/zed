@@ -1,6 +1,8 @@
 use super::*;
 use fs::{FakeFs, Fs as _};
-use gpui::{BackgroundExecutor, Modifiers, ScrollDelta, ScrollWheelEvent, TestAppContext};
+use gpui::{
+    BackgroundExecutor, Modifiers, PinchEvent, ScrollDelta, ScrollWheelEvent, TestAppContext,
+};
 use renderer::Renderer;
 use std::{path::Path, sync::Arc};
 use util::rel_path::rel_path;
@@ -124,35 +126,98 @@ fn resolves_named_pdf_destinations() {
 }
 
 #[gpui::test]
-async fn fresh_view_has_full_scroll_range_and_zooms_around_center(cx: &mut TestAppContext) {
-    let (_fs, _project, document) = open_document(cx).await;
+async fn pinch_zooms_around_pointer(cx: &mut TestAppContext) {
+    let (fs, _project, document) = open_document(cx).await;
+    let generation = cx.read(|cx| document.read(cx).generation);
+    fs.insert_file(
+        "/root/document.pdf",
+        test_pdf(&[(800, 600, "1 0 0"), (800, 600, "0 0 1")]),
+    )
+    .await;
+    document
+        .condition(cx, move |document, _| document.generation > generation)
+        .await;
     let (view, visual) = cx.add_window_view(|_, cx| PdfView::new(document.clone(), cx));
     visual.run_until_parked();
     let initial_scroll_range = visual.read(|cx| view.read(cx).list.max_offset_for_scrollbar().y);
     assert!(initial_scroll_range > px(100.));
-    let viewport = visual.read(|cx| view.read(cx).list.viewport_bounds());
-    visual.simulate_event(ScrollWheelEvent {
-        position: point(
-            viewport.left() + viewport.size.width / 2.,
-            viewport.top() + viewport.size.height / 2.,
-        ),
-        delta: ScrollDelta::Pixels(point(px(0.), px(-900.))),
+    let (pointer, page_position) = visual.read(|cx| {
+        let view = view.read(cx);
+        let bounds = view.page_bounds[0].expect("first page bounds");
+        let pointer = point(
+            bounds.left() + bounds.size.width * 0.6,
+            bounds.top() + bounds.size.height * 0.3,
+        );
+        let position = point(
+            f32::from(pointer.x - bounds.left()) / view.scale(cx),
+            f32::from(pointer.y - bounds.top()) / view.scale(cx),
+        );
+        (pointer, position)
+    });
+    visual.simulate_event(PinchEvent {
+        position: pointer,
+        delta: 0.5,
         ..Default::default()
     });
     visual.run_until_parked();
-    visual.read(|cx| assert!(document.read(cx).content(1).is_some()));
-    let expected = view.update_in(visual, |view, _, cx| {
-        let old_width = view.content_width(view.scale(cx));
-        view.set_zoom(Some(view.scale(cx) * 2.), cx);
-        let new_width = view.content_width(view.scale(cx));
-        (new_width - old_width) / 2.
+    visual.read(|cx| {
+        let view = view.read(cx);
+        let bounds = view.page_bounds[0].expect("zoomed page bounds");
+        let mapped = point(
+            bounds.left() + px(page_position.x * view.scale(cx)),
+            bounds.top() + px(page_position.y * view.scale(cx)),
+        );
+        assert!((f32::from(mapped.x - pointer.x)).abs() < 2.);
+        assert!((f32::from(mapped.y - pointer.y)).abs() < 2.);
     });
+}
+
+#[gpui::test]
+async fn zoomed_view_scrolls_through_all_pages(cx: &mut TestAppContext) {
+    let (fs, _project, document) = open_document(cx).await;
+    let generation = cx.read(|cx| document.read(cx).generation);
+    fs.insert_file(
+        "/root/document.pdf",
+        test_pdf(&[
+            (4000, 1600, "1 0 0"),
+            (4000, 1600, "0 1 0"),
+            (4000, 1600, "0 0 1"),
+        ]),
+    )
+    .await;
+    document
+        .condition(cx, move |document, _| document.generation > generation)
+        .await;
+    let (view, visual) = cx.add_window_view(|_, cx| PdfView::new(document, cx));
     visual.run_until_parked();
+    let bounds = visual.read(|cx| view.read(cx).horizontal_scroll.bounds());
+    let pointer = bounds.center();
+    view.update_in(visual, |view, _, cx| {
+        view.set_zoom(Some(view.scale(cx) * 1.5), pointer, cx)
+    });
+    visual.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let horizontal_offset = visual.read(|cx| {
+        let view = view.read(cx);
+        assert!(
+            view.list.max_offset_for_scrollbar().y > px(view.sizes[0].height * view.scale(cx) * 2.),
+            "scrollbar should cover all pages"
+        );
+        view.horizontal_scroll.offset().x
+    });
+    visual.simulate_event(ScrollWheelEvent {
+        position: pointer,
+        delta: ScrollDelta::Pixels(point(px(0.), px(-3000.))),
+        ..Default::default()
+    });
     visual.update(|window, cx| {
         let _ = window.draw(cx);
     });
     visual.read(|cx| {
-        assert!((f32::from(view.read(cx).horizontal_scroll.offset().x) + expected).abs() < 1.);
+        let view = view.read(cx);
+        assert!(view.list.logical_scroll_top().item_ix >= 1);
+        assert_eq!(view.horizontal_scroll.offset().x, horizontal_offset);
     });
 }
 
@@ -335,8 +400,17 @@ fn raster_dimensions_are_bounded() {
     ] {
         let key = RenderKey::new(0, size, 1000.);
         assert!(key.width <= 8192 && key.height <= 8192);
-        assert!(u32::from(key.width) * u32::from(key.height) <= 8_010_000);
+        assert!(u32::from(key.width) * u32::from(key.height) <= 24_010_000);
     }
+    let high_zoom = RenderKey::new(
+        0,
+        PageSize {
+            width: 612.,
+            height: 792.,
+        },
+        16.,
+    );
+    assert!(high_zoom.width > 4_000 && high_zoom.height > 5_000);
 }
 
 async fn open_document(
@@ -431,7 +505,7 @@ async fn split_shares_document_and_reload_preserves_fraction(cx: &mut TestAppCon
     let (view, visual) = cx.add_window_view(|_, cx| PdfView::new(document.clone(), cx));
     let split = view
         .update_in(visual, |view, window, cx| {
-            view.set_zoom(Some(1.), cx);
+            view.set_zoom(Some(1.), window.mouse_position(), cx);
             view.restore_position((1, 0.5), cx);
             view.clone_on_split(None, window, cx)
         })

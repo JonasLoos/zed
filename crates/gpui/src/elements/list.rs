@@ -1552,6 +1552,7 @@ impl Element for List {
         cx: &mut App,
     ) -> ListPrepaintState {
         let state = &mut *self.state.0.borrow_mut();
+        let preserve_size_hints = state.reset;
         state.reset = false;
 
         let mut style = Style::default();
@@ -1566,7 +1567,11 @@ impl Element for List {
         {
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
-                    size_hint: None,
+                    size_hint: if preserve_size_hints {
+                        item.size_hint()
+                    } else {
+                        None
+                    },
                     focus_handle: item.focus_handle(),
                 }),
                 (),

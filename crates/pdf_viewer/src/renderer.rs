@@ -13,7 +13,8 @@ use parking_lot::Mutex;
 
 use crate::interaction::{PageContent, extract_page_content};
 
-const MAX_PIXELS: f32 = 8_000_000.0;
+// An RGBA page at this limit fits within the document's 96 MiB image cache.
+const MAX_PIXELS: f32 = 24_000_000.0;
 const MAX_DIMENSION: f32 = 8192.0;
 const MAX_PENDING_PAGES: usize = 16;
 

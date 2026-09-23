@@ -158,6 +158,27 @@ impl PdfView {
             .fold(self.viewport_width, f32::max)
     }
 
+    fn vertical_offset(&self, page: usize, offset_in_page: f32, scale: f32) -> f32 {
+        self.sizes
+            .iter()
+            .take(page)
+            .map(|size| size.height * scale + PAGE_GAP)
+            .sum::<f32>()
+            + offset_in_page
+    }
+
+    fn page_at_offset(&self, offset: f32, scale: f32) -> (usize, f32) {
+        let mut remaining = offset.max(0.);
+        for (page, size) in self.sizes.iter().enumerate() {
+            let height = size.height * scale + PAGE_GAP;
+            if remaining < height || page + 1 == self.sizes.len() {
+                return (page, remaining.min(height));
+            }
+            remaining -= height;
+        }
+        (0, 0.)
+    }
+
     fn reset_list(&self, cx: &App) {
         let scale = self.scale(cx);
         self.list.reset_with_item_heights(
@@ -194,34 +215,69 @@ impl PdfView {
         });
     }
 
-    fn set_zoom(&mut self, zoom: Option<f32>, cx: &mut Context<Self>) {
-        let position = self.position(cx);
-        let old_width = self.content_width(self.scale(cx));
-        let old_center = -f32::from(self.horizontal_scroll.offset().x) + self.viewport_width / 2.;
+    fn set_zoom(&mut self, zoom: Option<f32>, pointer: Point<Pixels>, cx: &mut Context<Self>) {
+        let viewport = self.horizontal_scroll.bounds();
+        let anchor = if viewport.contains(&pointer) {
+            pointer
+        } else {
+            viewport.center()
+        };
+        let local_x = f32::from(anchor.x - viewport.left());
+        let local_y = f32::from(anchor.y - viewport.top());
+        let old_scale = self.scale(cx);
+        let old_width = self.content_width(old_scale);
+        let old_x = -f32::from(self.horizontal_scroll.offset().x) + local_x;
+        let old_y = -f32::from(self.list.scroll_px_offset_for_scrollbar().y) + local_y;
+        let (anchor_page, old_page_offset) = self.page_at_offset(old_y, old_scale);
         self.zoom = zoom.map(|zoom| zoom.clamp(MIN_ZOOM, MAX_ZOOM));
-        let new_width = self.content_width(self.scale(cx));
-        let new_scroll = (old_center / old_width * new_width - self.viewport_width / 2.)
+        let new_scale = self.scale(cx);
+        let new_width = self.content_width(new_scale);
+        let new_scroll = (new_width / 2. + (old_x - old_width / 2.) * new_scale / old_scale
+            - local_x)
             .clamp(0., (new_width - self.viewport_width).max(0.));
         self.horizontal_scroll
             .set_offset(point(px(-new_scroll), px(0.)));
+        let old_page_height = self
+            .sizes
+            .get(anchor_page)
+            .map_or(0., |size| size.height * old_scale);
+        let new_page_height = self
+            .sizes
+            .get(anchor_page)
+            .map_or(0., |size| size.height * new_scale);
+        let new_page_offset = if old_page_offset <= old_page_height {
+            old_page_offset * new_scale / old_scale
+        } else {
+            new_page_height + old_page_offset - old_page_height
+        };
+        let new_y = self.vertical_offset(anchor_page, new_page_offset, new_scale);
+        let max_scroll = (self.vertical_offset(self.sizes.len(), 0., new_scale)
+            - f32::from(viewport.size.height))
+        .max(0.);
+        let new_top = (new_y - local_y).clamp(0., max_scroll);
+        let (page, offset_in_item) = self.page_at_offset(new_top, new_scale);
         self.page_bounds.fill(None);
         self.reset_list(cx);
-        self.restore_position(position, cx);
+        self.current_page = page;
+        self.list.scroll_to(ListOffset {
+            item_ix: page,
+            offset_in_item: px(offset_in_item),
+        });
         cx.emit(PdfViewEvent);
         cx.notify();
     }
 
-    fn zoom_in(&mut self, _: &ZoomIn, _: &mut Window, cx: &mut Context<Self>) {
-        self.set_zoom(Some(self.scale(cx) * 1.2), cx);
+    fn zoom_in(&mut self, _: &ZoomIn, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_zoom(Some(self.scale(cx) * 1.2), window.mouse_position(), cx);
     }
-    fn zoom_out(&mut self, _: &ZoomOut, _: &mut Window, cx: &mut Context<Self>) {
-        self.set_zoom(Some(self.scale(cx) / 1.2), cx);
+    fn zoom_out(&mut self, _: &ZoomOut, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_zoom(Some(self.scale(cx) / 1.2), window.mouse_position(), cx);
     }
-    fn fit_width(&mut self, _: &FitWidth, _: &mut Window, cx: &mut Context<Self>) {
-        self.set_zoom(None, cx);
+    fn fit_width(&mut self, _: &FitWidth, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_zoom(None, window.mouse_position(), cx);
     }
-    fn reset_zoom(&mut self, _: &ResetZoom, _: &mut Window, cx: &mut Context<Self>) {
-        self.set_zoom(Some(1.), cx);
+    fn reset_zoom(&mut self, _: &ResetZoom, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_zoom(Some(1.), window.mouse_position(), cx);
     }
     fn go_to_page(&mut self, page: usize, cx: &mut Context<Self>) {
         self.restore_position((page, 0.), cx);
@@ -498,7 +554,11 @@ impl Render for PdfView {
                 }),
             )
             .on_pinch(cx.listener(|this, event: &gpui::PinchEvent, _, cx| {
-                this.set_zoom(Some(this.scale(cx) * (1. + event.delta)), cx);
+                this.set_zoom(
+                    Some(this.scale(cx) * (1. + event.delta)),
+                    event.position,
+                    cx,
+                );
             }))
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -592,6 +652,7 @@ impl Render for PdfView {
                             .id("pdf-horizontal-scroll")
                             .size_full()
                             .overflow_x_scroll()
+                            .restrict_scroll_to_axis()
                             .track_scroll(&self.horizontal_scroll)
                             .child(
                                 canvas(
