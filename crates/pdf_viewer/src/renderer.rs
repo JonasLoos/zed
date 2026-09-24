@@ -70,7 +70,7 @@ impl Renderer {
         let (result_sender, results) = async_channel::bounded(1);
         let (wake, wake_receiver) = async_channel::bounded(1);
         let queue = Arc::new(Mutex::new(RenderQueue::default()));
-        let worker = executor.spawn_dedicated({
+        let worker = executor.scheduler_executor().spawn_dedicated({
             let queue = queue.clone();
             move |_| async move {
                 let document = match load_document(content) {
