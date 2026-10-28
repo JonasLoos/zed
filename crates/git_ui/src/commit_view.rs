@@ -15,9 +15,9 @@ use git::{
 };
 use gpui::{
     AnyElement, App, AppContext as _, AsyncWindowContext, ClipboardItem, Context, Entity,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ObjectFit,
-    ParentElement, PromptLevel, Render, ScrollHandle, StatefulInteractiveElement as _, Styled,
-    StyledImage, Subscription, Task, WeakEntity, Window, actions, checkerboard, img,
+    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
+    PromptLevel, Render, ScrollHandle, StatefulInteractiveElement as _, Styled, Subscription, Task,
+    WeakEntity, Window, actions,
 };
 use language::{
     Buffer, BufferEvent, Capability, DiskState, File, LanguageRegistry, LineEnding,
@@ -51,6 +51,7 @@ use workspace::{
     searchable::SearchableItemHandle,
 };
 
+use crate::binary_diff_view::BinaryDiffView;
 use crate::commit_tooltip::CommitAvatar;
 use crate::git_panel::GitPanel;
 
@@ -94,8 +95,7 @@ pub struct CommitView {
     is_shallow_boundary: bool,
     file_filter: Option<RepoPath>,
     editing: Option<Entity<HistoricalEditing>>,
-    image_diff: Option<Arc<HistoricalImageDiff>>,
-    image_actual_size: bool,
+    binary_diff: Option<Entity<BinaryDiffView>>,
     _subscriptions: Vec<Subscription>,
     _load_diff_task: Task<Result<()>>,
 }
@@ -132,116 +132,6 @@ impl HistoricalEditing {
 }
 
 struct HistoricalEditHighlight;
-
-struct HistoricalImageDiff {
-    before: HistoricalImage,
-    after: HistoricalImage,
-}
-
-enum HistoricalImage {
-    Missing,
-    Loaded {
-        image: Arc<gpui::Image>,
-        metadata: project::image_store::ImageMetadata,
-    },
-    Error(SharedString),
-}
-
-impl HistoricalImage {
-    fn load(bytes: Option<Vec<u8>>, present: bool) -> Self {
-        let Some(bytes) = bytes else {
-            return if present {
-                Self::Error("Image data is unavailable from this repository".into())
-            } else {
-                Self::Missing
-            };
-        };
-        match project::ImageItem::compute_metadata_from_bytes(&bytes).and_then(|metadata| {
-            project::image_store::create_gpui_image(bytes).map(|image| (image, metadata))
-        }) {
-            Ok((image, metadata)) => Self::Loaded { image, metadata },
-            Err(error) => Self::Error(format!("Cannot preview image: {error}").into()),
-        }
-    }
-
-    fn render(&self, label: &'static str, actual_size: bool, cx: &App) -> impl IntoElement {
-        v_flex()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .overflow_hidden()
-            .child(
-                h_flex()
-                    .flex_none()
-                    .px_3()
-                    .py_2()
-                    .gap_2()
-                    .child(Label::new(label))
-                    .when_some(
-                        match self {
-                            Self::Loaded { metadata, .. } => Some(format!(
-                                "{} × {} · {} bytes",
-                                metadata.width, metadata.height, metadata.file_size
-                            )),
-                            _ => None,
-                        },
-                        |this, dimensions| {
-                            this.child(
-                                Label::new(dimensions)
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                        },
-                    ),
-            )
-            .child(
-                div()
-                    .id(label)
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_scroll()
-                    .child(match self {
-                        Self::Missing => div()
-                            .size_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(Label::new("Not present in this revision").color(Color::Muted))
-                            .into_any_element(),
-                        Self::Error(message) => div()
-                            .p_3()
-                            .child(Label::new(message.clone()).color(Color::Warning))
-                            .into_any_element(),
-                        Self::Loaded { image, metadata } => div()
-                            .debug_selector(move || format!("{label}-image"))
-                            .map(|this| {
-                                if actual_size {
-                                    this.w(px(metadata.width as f32))
-                                        .h(px(metadata.height as f32))
-                                } else {
-                                    this.size_full()
-                                }
-                            })
-                            .bg(checkerboard(
-                                cx.theme().colors().text_muted.opacity(0.15),
-                                8.,
-                            ))
-                            .child(
-                                img(image.clone())
-                                    .size_full()
-                                    .object_fit(ObjectFit::Contain)
-                                    .with_fallback(|| {
-                                        div()
-                                            .p_3()
-                                            .child(Label::new("Cannot display this image"))
-                                            .into_any_element()
-                                    }),
-                            )
-                            .into_any_element(),
-                    }),
-            )
-    }
-}
 
 fn can_edit_historical_buffer(buffer: &Buffer, text: &str, cx: &App) -> bool {
     let mut normalized = text.to_string();
@@ -595,48 +485,14 @@ impl CommitView {
             let mut file_statuses: HashMap<language::BufferId, FileStatus> = HashMap::default();
 
             for file in commit_diff.files {
-                if showing_full_file
-                    && file.is_binary
-                    && matches!(
-                        file.path
-                            .as_unix_str()
-                            .rsplit('.')
-                            .next()
-                            .map(str::to_ascii_lowercase)
-                            .as_deref(),
-                        Some(
-                            "png"
-                                | "jpg"
-                                | "jpeg"
-                                | "gif"
-                                | "webp"
-                                | "bmp"
-                                | "tif"
-                                | "tiff"
-                                | "ico"
-                                | "pnm"
-                                | "ppm"
-                                | "pgm"
-                                | "pbm"
-                        )
-                    )
-                {
-                    let images = cx
-                        .background_spawn(async move {
-                            HistoricalImageDiff {
-                                before: HistoricalImage::load(
-                                    file.old_binary,
-                                    file.old_text.is_some(),
-                                ),
-                                after: HistoricalImage::load(
-                                    file.new_binary,
-                                    file.new_text.is_some(),
-                                ),
-                            }
-                        })
-                        .await;
-                    this.update(cx, |this, cx| {
-                        this.image_diff = Some(Arc::new(images));
+                if showing_full_file && BinaryDiffView::supports(&file.path) {
+                    let preview = cx.update(|_, cx| BinaryDiffView::load(file, cx))?.await;
+                    this.update_in(cx, |this, window, cx| {
+                        let focused = this.focus_handle(cx).contains_focused(window, cx);
+                        this.binary_diff = Some(preview);
+                        if focused {
+                            this.focus_handle(cx).focus(window, cx);
+                        }
                         cx.notify();
                     })?;
                     continue;
@@ -924,8 +780,7 @@ impl CommitView {
             is_shallow_boundary,
             file_filter,
             editing: None,
-            image_diff: None,
-            image_actual_size: false,
+            binary_diff: None,
             _subscriptions: subscriptions,
             _load_diff_task: load_diff_task,
         }
@@ -1655,7 +1510,10 @@ impl EventEmitter<EditorEvent> for CommitView {}
 
 impl Focusable for CommitView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.editor.focus_handle(cx)
+        self.binary_diff.as_ref().map_or_else(
+            || self.editor.focus_handle(cx),
+            |view| view.focus_handle(cx),
+        )
     }
 }
 
@@ -1728,7 +1586,7 @@ impl Item for CommitView {
     ) -> Option<gpui::AnyEntity> {
         if type_id == TypeId::of::<Self>() {
             Some(self_handle.clone().into())
-        } else if self.image_diff.is_some() {
+        } else if self.binary_diff.is_some() {
             None
         } else if type_id == TypeId::of::<SplittableEditor>() {
             Some(self.editor.clone().into())
@@ -1740,7 +1598,7 @@ impl Item for CommitView {
     }
 
     fn as_searchable(&self, _: &Entity<Self>, _: &App) -> Option<Box<dyn SearchableItemHandle>> {
-        self.image_diff
+        self.binary_diff
             .is_none()
             .then(|| Box::new(self.editor.clone()) as Box<dyn SearchableItemHandle>)
     }
@@ -1918,8 +1776,10 @@ impl Item for CommitView {
                 is_shallow_boundary: self.is_shallow_boundary,
                 file_filter: self.file_filter.clone(),
                 editing: None,
-                image_diff: self.image_diff.clone(),
-                image_actual_size: self.image_actual_size,
+                binary_diff: self
+                    .binary_diff
+                    .as_ref()
+                    .map(|view| view.update(cx, |view, cx| view.clone_view(cx))),
                 _subscriptions: subscriptions,
                 _load_diff_task: Task::ready(Ok(())),
             };
@@ -1938,15 +1798,12 @@ impl Render for CommitView {
         v_flex()
             .key_context(if is_stash { "StashDiff" } else { "CommitDiff" })
             .on_action(cx.listener(Self::open_file_at_head_action))
-            .when(self.image_diff.is_some(), |this| this
-                .track_focus(&self.focus_handle(cx))
-                .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, window, cx| this.focus_handle(cx).focus(window, cx))))
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .when(self.file_filter.is_none(), |this| {
                 this.child(self.render_header(window, cx))
             })
-            .when(self.file_filter.is_some() && self.image_diff.is_none() && !self.is_shallow_boundary, |this| {
+            .when(self.file_filter.is_some() && self.binary_diff.is_none() && !self.is_shallow_boundary, |this| {
                 this.child(h_flex().px_3().py_1().flex_none().child(
                     Label::new(if self.editing.is_some() {
                         "Working file · changes since this commit are marked in orange"
@@ -1955,19 +1812,11 @@ impl Render for CommitView {
                     }).size(LabelSize::Small).color(if self.editing.is_some() { Color::Warning } else { Color::Muted })
                 ))
             })
-            .when_some(self.image_diff.clone(), |this, images| {
-                this.child(v_flex().flex_1().min_h_0()
-                    .child(h_flex().px_3().py_1().child(
-                        Button::new("image-size", if self.image_actual_size { "Fit Images" } else { "Actual Size" })
-                            .on_click(cx.listener(|this, _, _, cx| { this.image_actual_size = !this.image_actual_size; cx.notify(); }))
-                    ))
-                    .child(h_flex().flex_1().min_h_0()
-                        .child(images.before.render("Before", self.image_actual_size, cx))
-                        .child(Divider::vertical())
-                        .child(images.after.render("After", self.image_actual_size, cx))))
+            .when_some(self.binary_diff.clone(), |this, preview| {
+                this.child(div().flex_1().min_h_0().child(preview))
             })
             .when(
-                self.image_diff.is_none() && !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),
+                self.binary_diff.is_none() && !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),
                 |this| this.child(div().flex_grow(1.).child(self.editor.clone())),
             )
             .when(self.is_shallow_boundary, |this| {
@@ -2125,6 +1974,7 @@ fn stash_matches_index(sha: &str, stash_index: usize, repo: &Repository) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binary_diff_view::BinaryPreview;
     use editor::ToPoint;
     use git::repository::repo_path;
     use gpui::{EmptyView, TestAppContext};
@@ -2376,7 +2226,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_historical_image_diff(cx: &mut TestAppContext) {
+    async fn test_historical_binary_diff(cx: &mut TestAppContext) {
         init_test(cx);
         let red = b"P6\n1 1\n255\n\xff\0\0".to_vec();
         let blue = b"P6\n1 1\n255\n\0\0\xff".to_vec();
@@ -2431,18 +2281,19 @@ mod tests {
             view.read_with(cx, |view, cx| {
                 assert!(view.editing.is_none());
                 assert!(!view.can_save(cx));
-                let images = view.image_diff.as_ref().expect("image diff");
+                let images = view.binary_diff.as_ref().expect("image diff").read(cx);
                 for (image, exists) in [
                     (&images.before, before.is_some()),
                     (&images.after, after.is_some()),
                 ] {
                     match image {
-                        HistoricalImage::Loaded { metadata, .. } => {
+                        BinaryPreview::Loaded { metadata, .. } => {
                             assert!(exists);
                             assert_eq!((metadata.width, metadata.height), (1, 1));
                         }
-                        HistoricalImage::Missing => assert!(!exists),
-                        HistoricalImage::Error(error) => panic!("unexpected image error: {error}"),
+                        BinaryPreview::Pdf(_) => panic!("unexpected PDF preview"),
+                        BinaryPreview::Missing => assert!(!exists),
+                        BinaryPreview::Error(error) => panic!("unexpected image error: {error}"),
                     }
                 }
             });
@@ -2464,8 +2315,13 @@ mod tests {
                 }
             }
             view.update(cx, |view, cx| {
-                view.image_actual_size = true;
-                cx.notify();
+                view.binary_diff
+                    .as_ref()
+                    .expect("image diff")
+                    .update(cx, |view, cx| {
+                        view.actual_size = true;
+                        cx.notify();
+                    });
             });
             cx.run_until_parked();
             cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -2479,14 +2335,6 @@ mod tests {
             let bounds = cx.debug_bounds(selector).expect("actual-size image");
             assert_eq!(bounds.size, gpui::size(px(1.), px(1.)));
         }
-        assert!(matches!(
-            HistoricalImage::load(Some(b"broken image".to_vec()), true),
-            HistoricalImage::Error(_)
-        ));
-        assert!(matches!(
-            HistoricalImage::load(None, true),
-            HistoricalImage::Error(_)
-        ));
     }
 
     #[gpui::test]

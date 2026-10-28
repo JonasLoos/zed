@@ -2707,6 +2707,23 @@ impl GitPanel {
             return;
         };
         for entry in self.effective_status_entries() {
+            let opened = self
+                .workspace
+                .update(cx, |workspace, cx| {
+                    crate::binary_diff_view::BinaryDiffView::try_deploy(
+                        workspace,
+                        &entry.repo_path,
+                        repository.clone(),
+                        project::git_store::diff_buffer_list::DiffBase::Head,
+                        window,
+                        cx,
+                    )
+                })
+                .log_err()
+                .unwrap_or(false);
+            if opened {
+                continue;
+            }
             SoloDiffView::open_or_focus(
                 entry,
                 repository.clone(),

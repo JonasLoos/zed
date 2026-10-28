@@ -69,7 +69,7 @@ struct TextSelection {
 
 pub struct PdfView {
     document: Entity<PdfDocument>,
-    path: ProjectPath,
+    path: Option<ProjectPath>,
     focus_handle: FocusHandle,
     list: ListState,
     horizontal_scroll: ScrollHandle,
@@ -89,6 +89,23 @@ pub struct PdfViewEvent;
 impl EventEmitter<PdfViewEvent> for PdfView {}
 
 impl PdfView {
+    pub fn from_bytes(bytes: Vec<u8>, cx: &mut App) -> Task<Result<Entity<Self>>> {
+        let document = PdfDocument::from_bytes(bytes, cx);
+        cx.spawn(async move |cx| {
+            let document = document.await?;
+            Ok(cx.new(|cx| Self::new(document, cx)))
+        })
+    }
+
+    pub fn clone_view(&self, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::new(self.document.clone(), cx);
+        view.zoom = self.zoom;
+        view.viewport_width = self.viewport_width;
+        view.reset_list(cx);
+        view.restore_position(self.position(cx), cx);
+        view
+    }
+
     fn new(document: Entity<PdfDocument>, cx: &mut Context<Self>) -> Self {
         let list = ListState::new(document.read(cx).sizes.len(), ListAlignment::Top, px(0.));
         let view = cx.weak_entity();
@@ -570,6 +587,7 @@ impl Render for PdfView {
                 h_flex()
                     .w_full()
                     .flex_none()
+                    .flex_wrap()
                     .gap_2()
                     .p_2()
                     .border_b_1()
@@ -628,7 +646,7 @@ impl Render for PdfView {
                     .child(
                         Button::new("reload", "Reload")
                             .style(ButtonStyle::Subtle)
-                            .disabled(loading)
+                            .disabled(loading || self.path.is_none())
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.reload(&Reload, window, cx)),
                             ),
@@ -704,24 +722,25 @@ impl Item for PdfView {
         self.document
             .read(cx)
             .abs_path(cx)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("PDF")
-            .to_owned()
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "PDF".to_owned())
             .into()
     }
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
         Some(
             self.document
                 .read(cx)
-                .abs_path(cx)
+                .abs_path(cx)?
                 .to_string_lossy()
                 .into_owned()
                 .into(),
         )
     }
     fn tab_icon(&self, _: &Window, cx: &App) -> Option<Icon> {
-        FileIcons::get_icon(&self.document.read(cx).abs_path(cx), cx).map(Icon::from_path)
+        FileIcons::get_icon(&self.document.read(cx).abs_path(cx)?, cx).map(Icon::from_path)
     }
     fn to_item_events(_: &Self::Event, emit: &mut dyn FnMut(ItemEvent)) {
         emit(ItemEvent::UpdateTab);
@@ -748,15 +767,7 @@ impl Item for PdfView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Option<Entity<Self>>> {
-        let position = self.position(cx);
-        Task::ready(Some(cx.new(|cx| {
-            let mut view = Self::new(self.document.clone(), cx);
-            view.zoom = self.zoom;
-            view.viewport_width = self.viewport_width;
-            view.reset_list(cx);
-            view.restore_position(position, cx);
-            view
-        })))
+        Task::ready(Some(cx.new(|cx| self.clone_view(cx))))
     }
 }
 
@@ -859,7 +870,7 @@ impl SerializableItem for PdfView {
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<()>>> {
         let workspace_id = workspace.database_id()?;
-        let path = self.document.read(cx).abs_path(cx);
+        let path = self.document.read(cx).abs_path(cx)?;
         let (page, fraction) = self.restored_position.unwrap_or_else(|| self.position(cx));
         let zoom = self.zoom.map(f64::from);
         let database = PdfViewerDb::global(cx);

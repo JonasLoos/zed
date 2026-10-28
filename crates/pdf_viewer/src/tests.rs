@@ -486,6 +486,46 @@ async fn reload_preserves_document_on_failure_and_recovers(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+async fn byte_snapshots_are_independent_of_working_file(cx: &mut TestAppContext) {
+    let (fs, _project, working_document) = open_document(cx).await;
+    let before = cx
+        .update(|cx| PdfView::from_bytes(test_pdf(&[(300, 400, "1 0 0")]), cx))
+        .await
+        .expect("before snapshot");
+    let after = cx
+        .update(|cx| PdfView::from_bytes(test_pdf(&[(600, 800, "0 0 1"), (200, 300, "0 1 0")]), cx))
+        .await
+        .expect("after snapshot");
+    let generation = working_document.read_with(cx, |document, _| document.generation);
+    fs.insert_file("/root/document.pdf", test_pdf(&[(100, 100, "1 1 1")]))
+        .await;
+    working_document
+        .condition(cx, move |document, _| document.generation > generation)
+        .await;
+    cx.update(|cx| {
+        for (view, width, pages) in [(&before, 300., 1), (&after, 600., 2)] {
+            let view = view.read(cx);
+            assert_eq!(view.sizes.len(), pages);
+            assert_eq!(view.sizes.first().expect("first page").width, width);
+            assert!(view.path.is_none());
+            assert!(view.document.read(cx).abs_path(cx).is_none());
+            assert!(project::ProjectItem::project_path(view.document.read(cx), cx).is_none());
+        }
+    });
+    before.update(cx, |view, cx| {
+        view.document
+            .update(cx, |document, cx| document.reload(false, cx))
+    });
+    cx.run_until_parked();
+    assert!(!before.read_with(cx, |view, cx| view.document.read(cx).loading));
+    assert!(
+        cx.update(|cx| PdfView::from_bytes(b"broken PDF".to_vec(), cx))
+            .await
+            .is_err()
+    );
+}
+
+#[gpui::test]
 async fn split_shares_document_and_reload_preserves_fraction(cx: &mut TestAppContext) {
     let (fs, project, document) = open_document(cx).await;
     let generation = cx.read(|cx| document.read(cx).generation);
@@ -498,7 +538,12 @@ async fn split_shares_document_and_reload_preserves_fraction(cx: &mut TestAppCon
         .condition(cx, move |document, _| document.generation > generation)
         .await;
     let same_document = cx.update(|cx| {
-        PdfDocument::open(&project, &document.read(cx).path.clone(), cx).expect("reopen PDF")
+        PdfDocument::open(
+            &project,
+            &document.read(cx).path.clone().expect("file path"),
+            cx,
+        )
+        .expect("reopen PDF")
     });
     assert_eq!(document, same_document);
     drop(same_document);
@@ -600,12 +645,16 @@ async fn atomic_replacement_and_rename_keep_the_same_document(cx: &mut TestAppCo
     .expect("rename PDF");
     document
         .condition(cx, |document, _| {
-            document.path.path.as_ref() == rel_path("renamed.PDF") && !document.loading
+            document
+                .path
+                .as_ref()
+                .is_some_and(|path| path.path.as_ref() == rel_path("renamed.PDF"))
+                && !document.loading
         })
         .await;
     let reopened = cx
         .update(|cx| {
-            let path = document.read(cx).path.clone();
+            let path = document.read(cx).path.clone().expect("file path");
             <PdfDocument as project::ProjectItem>::try_open(&project, &path, cx)
                 .expect("PDF handler")
         })

@@ -144,6 +144,20 @@ impl ProjectDiff {
         );
         let intended_repo = workspace.project().read(cx).active_repository(cx);
 
+        if let Some(entry) = &entry
+            && let Some(repository) = &intended_repo
+            && crate::binary_diff_view::BinaryDiffView::try_deploy(
+                workspace,
+                &entry.repo_path,
+                repository.clone(),
+                DiffBase::Head,
+                window,
+                cx,
+            )
+        {
+            return;
+        }
+
         let existing = workspace.items_of_type::<Self>(cx).next();
         let project_diff = if let Some(existing) = existing {
             existing.update(cx, |project_diff, cx| {
@@ -192,6 +206,24 @@ impl ProjectDiff {
         cx: &mut Context<Workspace>,
     ) {
         telemetry::event!("Git Diff Opened", source = "Agent Panel");
+        let target = workspace
+            .project()
+            .read(cx)
+            .git_store()
+            .read(cx)
+            .repository_and_path_for_project_path(&project_path, cx);
+        if let Some((repository, path)) = target
+            && crate::binary_diff_view::BinaryDiffView::try_deploy(
+                workspace,
+                &path,
+                repository,
+                DiffBase::Head,
+                window,
+                cx,
+            )
+        {
+            return;
+        }
         let existing = workspace.items_of_type::<Self>(cx).next();
         let project_diff = if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);

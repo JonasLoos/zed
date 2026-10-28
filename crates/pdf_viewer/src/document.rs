@@ -35,19 +35,19 @@ impl CachedPage {
 }
 
 pub struct PdfDocument {
-    pub path: ProjectPath,
+    pub path: Option<ProjectPath>,
     pub sizes: Vec<PageSize>,
     pub generation: u64,
     pub loading: bool,
     pub error: Option<SharedString>,
     pub deleted: bool,
     entry_id: Option<ProjectEntryId>,
-    worktree: Entity<Worktree>,
+    worktree: Option<Entity<Worktree>>,
     renderer: Option<Renderer>,
     content: Vec<Option<Arc<PageContent>>>,
     cache: VecDeque<CachedPage>,
     cache_bytes: usize,
-    _subscription: Subscription,
+    _subscription: Option<Subscription>,
     reload_task: Task<()>,
     render_task: Task<()>,
 }
@@ -55,6 +55,39 @@ pub struct PdfDocument {
 impl gpui::EventEmitter<()> for PdfDocument {}
 
 impl PdfDocument {
+    fn new(cx: &mut Context<Self>) -> Self {
+        cx.on_release(|this, cx| this.clear_cache(cx)).detach();
+        Self {
+            path: None,
+            sizes: Vec::new(),
+            generation: 0,
+            loading: false,
+            error: None,
+            deleted: false,
+            entry_id: None,
+            worktree: None,
+            renderer: None,
+            content: Vec::new(),
+            cache: VecDeque::new(),
+            cache_bytes: 0,
+            _subscription: None,
+            reload_task: Task::ready(()),
+            render_task: Task::ready(()),
+        }
+    }
+
+    pub fn from_bytes(bytes: Vec<u8>, cx: &mut App) -> Task<Result<Entity<Self>>> {
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |cx| {
+            let renderer = Renderer::new(bytes, executor).await?;
+            Ok(cx.new(|cx| {
+                let mut document = Self::new(cx);
+                document.install_renderer(renderer, cx);
+                document
+            }))
+        })
+    }
+
     pub fn open(
         project: &Entity<Project>,
         path: &ProjectPath,
@@ -64,7 +97,7 @@ impl PdfDocument {
         for (owner, document) in existing {
             if owner == project.downgrade()
                 && let Some(document) = document.upgrade()
-                && document.read(cx).path == *path
+                && document.read(cx).path.as_ref() == Some(path)
             {
                 return Ok(document);
             }
@@ -80,8 +113,11 @@ impl PdfDocument {
         let document = cx.new(|cx| {
             let subscription = cx.subscribe(&worktree, |this: &mut Self, worktree, event, cx| {
                 if let worktree::Event::UpdatedEntries(changes) = event {
+                    let Some(document_path) = this.path.as_mut() else {
+                        return;
+                    };
                     if !changes.iter().any(|(path, entry_id, _)| {
-                        *path == this.path.path || Some(*entry_id) == this.entry_id
+                        *path == document_path.path || Some(*entry_id) == this.entry_id
                     }) {
                         return;
                     }
@@ -89,33 +125,20 @@ impl PdfDocument {
                     let entry = this
                         .entry_id
                         .and_then(|id| snapshot.entry_for_id(id))
-                        .or_else(|| snapshot.entry_for_path(&this.path.path));
+                        .or_else(|| snapshot.entry_for_path(&document_path.path));
                     this.deleted = entry.is_none();
                     if let Some(entry) = entry {
-                        this.path.path = entry.path.clone();
+                        document_path.path = entry.path.clone();
                         this.entry_id = Some(entry.id);
                     }
                     this.reload(true, cx);
                 }
             });
-            cx.on_release(|this, cx| this.clear_cache(cx)).detach();
-            let mut document = Self {
-                path: path.clone(),
-                sizes: Vec::new(),
-                generation: 0,
-                loading: true,
-                error: None,
-                deleted: false,
-                entry_id,
-                worktree,
-                renderer: None,
-                content: Vec::new(),
-                cache: VecDeque::new(),
-                cache_bytes: 0,
-                _subscription: subscription,
-                reload_task: Task::ready(()),
-                render_task: Task::ready(()),
-            };
+            let mut document = Self::new(cx);
+            document.path = Some(path.clone());
+            document.entry_id = entry_id;
+            document.worktree = Some(worktree);
+            document._subscription = Some(subscription);
             document.reload(false, cx);
             document
         });
@@ -127,14 +150,23 @@ impl PdfDocument {
         Ok(document)
     }
 
-    pub fn abs_path(&self, cx: &App) -> std::path::PathBuf {
-        self.worktree
-            .read(cx)
-            .abs_path()
-            .join(self.path.path.as_std_path())
+    pub fn abs_path(&self, cx: &App) -> Option<std::path::PathBuf> {
+        Some(
+            self.worktree
+                .as_ref()?
+                .read(cx)
+                .abs_path()
+                .join(self.path.as_ref()?.path.as_std_path()),
+        )
     }
 
     pub fn reload(&mut self, debounce: bool, cx: &mut Context<Self>) {
+        let Some(worktree) = self.worktree.clone() else {
+            return;
+        };
+        let Some(path) = self.path.clone() else {
+            return;
+        };
         self.loading = true;
         let executor = cx.background_executor().clone();
         self.reload_task = cx.spawn(async move |this, cx| {
@@ -142,12 +174,8 @@ impl PdfDocument {
                 executor.timer(RELOAD_DELAY).await;
             }
             for attempt in 0..3 {
-                let load = this.update(cx, |this, cx| {
-                    this.worktree.update(cx, |worktree, cx| {
-                        worktree.load_binary_file(&this.path.path, cx)
-                    })
-                });
-                let Ok(load) = load else { return };
+                let load =
+                    worktree.update(cx, |worktree, cx| worktree.load_binary_file(&path.path, cx));
                 let result = match load.await {
                     Ok(file) => Renderer::new(file.content, executor.clone())
                         .await
@@ -298,7 +326,7 @@ impl project::ProjectItem for PdfDocument {
         self.entry_id
     }
     fn project_path(&self, _: &App) -> Option<ProjectPath> {
-        Some(self.path.clone())
+        self.path.clone()
     }
     fn is_dirty(&self) -> bool {
         false

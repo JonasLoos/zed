@@ -45,6 +45,7 @@ menu.workspace = true
 multi_buffer.workspace = true
 notifications.workspace = true
 picker.workspace = true
+pdf_viewer.workspace = true
 project.workspace = true
 prompt_store.workspace = true
 rand.workspace = true

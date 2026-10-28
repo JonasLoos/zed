@@ -266,6 +266,9 @@ fn decode_commit_diff(
                 mut is_binary,
             } = file;
 
+            // PDFs can contain only ASCII bytes and still require a visual preview.
+            is_binary |= path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
+
             if is_binary {
                 let include_binary = binary_path == Some(&path);
                 return CommitFile {
@@ -10360,6 +10363,50 @@ impl Repository {
         (job_tx, worker_task)
     }
 
+    pub fn load_binary_diff(
+        &self,
+        path: RepoPath,
+        base: diff_buffer_list::DiffBase,
+        cx: &App,
+    ) -> Task<Result<(Option<Vec<u8>>, Option<Vec<u8>>)>> {
+        let state = self.repository_state.clone();
+        let absolute_path = self.work_directory_abs_path.join(path.as_std_path());
+        cx.background_spawn(async move {
+            let RepositoryState::Local(LocalRepositoryState { backend, fs, .. }) =
+                state.await.map_err(|error| anyhow::anyhow!(error))?
+            else {
+                anyhow::bail!(
+                    "Binary diff previews are currently available only for local repositories"
+                );
+            };
+            let revisions = match base {
+                diff_buffer_list::DiffBase::Head => vec![format!("HEAD:{}", path.as_unix_str())],
+                diff_buffer_list::DiffBase::Index => vec![format!(":{}", path.as_unix_str())],
+                diff_buffer_list::DiffBase::Staged => vec![
+                    format!("HEAD:{}", path.as_unix_str()),
+                    format!(":{}", path.as_unix_str()),
+                ],
+                diff_buffer_list::DiffBase::Merge { .. } => {
+                    anyhow::bail!("Binary merge-base previews are not supported")
+                }
+            };
+            let mut contents = backend.load_revisions(revisions).await?.into_iter();
+            let before = contents.next().flatten();
+            let after = if base == diff_buffer_list::DiffBase::Staged {
+                contents.next().flatten()
+            } else {
+                match fs.load_bytes(&absolute_path).await {
+                    Ok(bytes) => Some(bytes),
+                    Err(_) if fs.metadata(&absolute_path).await?.is_none() => None,
+                    Err(error) => {
+                        return Err(error).context("Cannot read working file for binary preview");
+                    }
+                }
+            };
+            Ok((before, after))
+        })
+    }
+
     fn load_staged_text(
         &mut self,
         buffer_id: BufferId,
@@ -11515,6 +11562,96 @@ mod tests {
     use serde_json::json;
     use settings::SettingsStore;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn test_ascii_pdf_commit_diff_preserves_bytes() {
+        let bytes = b"%PDF-1.7\nASCII document\n%%EOF".to_vec();
+        let path = repo_path("document.PDF");
+        let diff = decode_commit_diff(
+            git::repository::CommitDiff {
+                files: vec![git::repository::CommitFile {
+                    path: path.clone(),
+                    old_content: None,
+                    new_content: Some(bytes.clone()),
+                    is_binary: false,
+                }],
+                is_shallow_boundary: false,
+            },
+            Some(&path),
+        );
+        let file = diff.files.first().expect("PDF file");
+        assert!(file.is_binary);
+        assert_eq!(file.new_binary, Some(bytes));
+        assert_eq!(file.status(), CommitFileStatus::Added);
+    }
+
+    #[gpui::test]
+    async fn test_binary_diff_sources(cx: &mut TestAppContext) {
+        use diff_buffer_list::DiffBase;
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ ".git": {} })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        let repository = project.read_with(cx, |project, cx| {
+            project.active_repository(cx).expect("repository")
+        });
+        let head = b"head\0\xff".to_vec();
+        let index = b"index\0\xfe".to_vec();
+        let working = b"working\0\xfd".to_vec();
+        for (head, index, working) in [
+            (
+                Some(head.clone()),
+                Some(index.clone()),
+                Some(working.clone()),
+            ),
+            (None, None, Some(working.clone())),
+            (None, Some(index.clone()), Some(working.clone())),
+            (Some(head.clone()), Some(index.clone()), None),
+            (Some(head), None, None),
+        ] {
+            fs.with_git_state(Path::new("/project/.git"), false, |state| {
+                state.head_contents.clear();
+                state.index_contents.clear();
+                if let Some(bytes) = &head {
+                    state
+                        .head_contents
+                        .insert(repo_path("file.pdf"), bytes.clone());
+                }
+                if let Some(bytes) = &index {
+                    state
+                        .index_contents
+                        .insert(repo_path("file.pdf"), bytes.clone());
+                }
+            })
+            .expect("set repository contents");
+            if let Some(bytes) = &working {
+                fs.insert_file("/project/file.pdf", bytes.clone()).await;
+            } else {
+                fs.remove_file(
+                    Path::new("/project/file.pdf"),
+                    RemoveOptions {
+                        ignore_if_not_exists: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("remove working file");
+            }
+            for (base, expected_before, expected_after) in [
+                (DiffBase::Head, head.clone(), working.clone()),
+                (DiffBase::Index, index.clone(), working.clone()),
+                (DiffBase::Staged, head.clone(), index.clone()),
+            ] {
+                let result = repository
+                    .read_with(cx, |repository, cx| {
+                        repository.load_binary_diff(repo_path("file.pdf"), base, cx)
+                    })
+                    .await
+                    .expect("load binary diff");
+                assert_eq!(result, (expected_before, expected_after));
+            }
+        }
+    }
 
     #[test]
     fn test_commit_diff_preserves_binary_versions() {

@@ -4,6 +4,7 @@ use editor::{Editor, actions::DiffClipboardWithSelectionData};
 
 use workspace::{Toast, notifications::NotificationId};
 
+mod binary_diff_view;
 mod blame_ui;
 pub mod clone;
 
@@ -380,6 +381,22 @@ fn open_file_diff(
     cx: &mut App,
 ) {
     window.defer(cx, move |window, cx| {
+        if workspace
+            .update(cx, |workspace, cx| {
+                binary_diff_view::BinaryDiffView::try_deploy(
+                    workspace,
+                    &entry.repo_path,
+                    repository.clone(),
+                    project::git_store::diff_buffer_list::DiffBase::Head,
+                    window,
+                    cx,
+                )
+            })
+            .log_err()
+            .unwrap_or(false)
+        {
+            return;
+        }
         SoloDiffView::open_or_focus(entry, repository, workspace.clone(), window, cx)
             .detach_and_notify_err(workspace, window, cx);
     });

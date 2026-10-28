@@ -7121,6 +7121,7 @@ dependencies = [
  "menu",
  "multi_buffer",
  "notifications",
+ "pdf_viewer",
  "picker",
  "pretty_assertions",
  "project",

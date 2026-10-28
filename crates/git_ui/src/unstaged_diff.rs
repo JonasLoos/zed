@@ -145,6 +145,19 @@ impl UnstagedDiff {
             }
         );
         let intended_repo = workspace.project().read(cx).active_repository(cx);
+        if let Some(entry) = &entry
+            && let Some(repository) = &intended_repo
+            && crate::binary_diff_view::BinaryDiffView::try_deploy(
+                workspace,
+                &entry.repo_path,
+                repository.clone(),
+                DiffBase::Index,
+                window,
+                cx,
+            )
+        {
+            return;
+        }
         let existing = workspace.items_of_type::<Self>(cx).next();
         let unstaged_diff = if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
